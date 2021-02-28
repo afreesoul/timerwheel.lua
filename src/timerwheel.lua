@@ -1,89 +1,37 @@
---- Timer wheel implementation
---
--- Efficient timer for timeout related timers: fast insertion, deletion, and
--- execution (all as O(1) implemented), but with lesser precision.
---
--- This module will not provide the timer/runloop itself. Use your own runloop
--- and call `wheel:step` to check and execute timers.
---
--- Implementation:
--- Consider a stack of rings, a timer beyond the current ring size is in the
--- next ring (or beyond). Precision is based on a slot with a specific size.
---
--- The code explicitly avoids using `pairs`, `ipairs` and `next` to ensure JIT
--- compilation when using LuaJIT
+---时间轮实现，改造自：https://github.com/Tieske/timerwheel.lua
+---没用pair保证反复执行逻辑是一致的，但是没法保证最小时间段内的所有定时器是按顺序执行的
+---比如最小时间段是6毫秒，那么同一时刻你分别创建定时5毫秒和定时4毫秒，是不知道谁先回调的
 
-local default_now  -- return time in seconds
-if ngx then
-  default_now = ngx.now
-else
-  local ok, socket = pcall(require, "socket")
-  if ok then
-    default_now = socket.gettime
-  else
-    default_now = nil -- we don't have a default
-  end
-end
-
-local ok, new_tab = pcall(require, "table.new")
-if not ok then
-  new_tab = function(narr, nrec) return {} end
-end
-
-local xpcall = require("coxpcall").xpcall
+local xpcall = xpcall
 local default_err_handler = function(err)
-  io.stderr:write(debug.traceback("TimerWheel callback failed with: " .. tostring(err)))
+  print(debug.traceback("TimerWheel callback failed with: " .. tostring(err)))
 end
 
-local math_floor = math.floor
-local math_huge = math.huge
 local EMPTY = {}
 
 local _M = {}
 
 
---- Creates a new timer wheel.
+---创建时间轮定时器
 -- The options are:
---
---  - `precision` (optional) precision of the timer wheel in seconds (slot size),
--- defaults to 0.050
---  - `ringsize` (optional) number of slots in each ring, defaults to 72000 (1
--- hour span, based on default `precision`)
---  - `now` (optional) a function returning the curent time in seconds. Defaults
--- to `luasocket.gettime` or `ngx.now` if available.
---  - `err_handler` (optional) a function to use as error handler in a `xpcall` when
--- executing the callback. The default will send the stacktrace on `stderr`.
---
--- @param opts the options table
--- @return the timerwheel object
-function _M.new(opts)
-  assert(opts ~= _M, "new should not be called with colon ':' notation")
-
-  opts = opts or EMPTY
-  assert(type(opts) == "table", "expected options to be a table")
-
-  local precision = opts.precision or 0.050  -- in seconds, 50ms by default
-  local ringsize  = opts.ringsize or 72000   -- #slots per ring, default 1 hour = 60 * 60 / 0.050
-  local now       = opts.now or default_now  -- function to get time in seconds
-  local err_handler = opts.err_handler or default_err_handler
-  opts = nil   -- luacheck: ignore
-
-  assert(type(precision) == "number" and precision > 0,
-    "expected 'precision' to be number > 0")
-  assert(type(ringsize) == "number" and ringsize > 0 and math_floor(ringsize) == ringsize,
-    "expected 'ringsize' to be an integer number > 0")
-  assert(type(now) == "function",
-    "expected 'now' to be a function, got: " .. type(now))
-  assert(type(err_handler) == "function",
-    "expected 'err_handler' to be a function, got: " .. type(err_handler))
-
-  local start     = now()
+---@param precision number @最小时间段，单位毫秒,数值越大误差越大，1最精确，但是效率会低，一般逻辑可以6，渲染可以11
+---@param ringsize number  @每轮时间槽数量，1轮能表示ringsize*precision毫秒，
+---最好2轮就能涵盖所有定时时长，建议ringsize=最长定时时间/precision/最大轮数，最大轮数不要超过30，例如最长30分钟,ringsize=30*60*1000/6/30=10000
+---@param start number @开始时间，一般0
+---@param start1970 number @开始时间戳，一般0，服务器定时器可能用到
+---@return the timerwheel object
+function _M.New(precision, ringsize, start, start1970)
+  assert(math.type(precision) == "integer" and precision > 0, "expected 'precision' to be an integer number > 0")
+  assert(math.type(ringsize) == "integer" and ringsize > 0, "expected 'ringsize' to be an integer number > 0")
+  local now = start    --当前时间
+  local sumtime = 0    --定时器累计时间
   local position  = 1  -- position next up in first ring of timer wheel
   local id_count  = 0  -- counter to generate unique ids (all negative)
   local id_list   = {} -- reverse lookup table to find timers by id
   local rings     = {} -- list of rings, index 1 is the current ring
   local rings_n   = 0  -- the number of the last ring in the rings list
   local count     = 0  -- how many timers do we have
+  ---@class wheel
   local wheel     = {} -- the returned wheel object
 
   -- because we assume hefty setting and cancelling, we're reusing tables
@@ -94,12 +42,13 @@ function _M.new(opts)
   --- Checks and executes timers.
   -- Call this function (at least) every `precision` seconds.
   -- @return `true`
-  function wheel:step()
-    local new_position = math_floor((now() - start) / precision) + 1
+  function wheel:Update(deltaTime)
+    sumtime = sumtime + deltaTime
+    local toptime = now + deltaTime
     local ring = rings[1] or EMPTY
 
-    while position < new_position do
-
+    while now < toptime do
+      now = now + precision
       -- get the expired slot, and remove it from the ring
       local slot = ring[position]
       ring[position] = nil
@@ -117,7 +66,6 @@ function _M.new(opts)
         ring = rings[1] or EMPTY
         start = start + ringsize * precision
         position = 1
-        new_position = new_position - ringsize
       end
 
       -- only deal with slot after forwarding pointers, to make sure that
@@ -128,12 +76,15 @@ function _M.new(opts)
         local ids = slot.ids
         local args = slot.arg
         for i = 1, slot.n do
-          local id  = slot[i];  slot[i]  = nil; slot[id] = nil
-          local cb  = ids[id];  ids[id]  = nil
-          local arg = args[id]; args[id] = nil
-          id_list[id] = nil
-          count = count - 1
-          xpcall(cb, err_handler, arg)
+          local id  = slot[i]
+          if id then
+            slot[i]  = nil; slot[id] = nil
+            local cb  = ids[id];  ids[id]  = nil
+            local arg = args[id]; args[id] = nil
+            id_list[id] = nil
+            count = count - 1
+            xpcall(cb, default_err_handler, arg)
+          end
         end
 
         slot.n = 0
@@ -146,44 +97,44 @@ function _M.new(opts)
     return true
   end
 
-  --- Gets the number of timers.
-  -- @return number of timers
-  function wheel:count()
+  ---获得定时器数量
+  function wheel:Count()
     return count
   end
 
-  --- Sets a timer.
-  -- @param expire_in in how many seconds should the timer expire
-  -- @param cb callback function to execute upon expiring (NOTE: the
-  -- callback will run within an `xpcall`)
-  -- @param arg parameter to be passed to `cb` when executing
-  -- @return id
-  -- @usage
-  -- local cb = function(arg)
-  --   print("timer executed with: ", arg)  --> "timer executed with: hello world"
-  -- end
-  -- local id = wheel:set(5, cb, "hello world")
-  --
-  -- -- do stuff here, while regularly calling `wheel:step()`
-  --
-  -- wheel:cancel(id)  -- cancel the timer again
-  function wheel:set(expire_in, cb, arg)
-    local time_expire = now() + expire_in
-    local pos = math_floor((time_expire - start) / precision) + 1
+  ---获得当前时间
+  function wheel:Time()
+    return now
+  end
+
+  ---获得当前时间戳，用于本地模拟服务器时间戳
+  function wheel:Time1970()
+    return sumtime + start1970
+  end
+
+  ---设置定时器
+  ---@param expire_in number @整数，单位毫秒
+  ---@param cb  function(arg) @回调函数
+  ---@param arg any @回调函数的参数，没有不用填
+  ---@return number @返回定时器ID，取消定时器时用到wheel:cancel(id)
+  function wheel:SetTime(expire_in, cb, arg)
+    local time_expire = now + expire_in
+    local pos = ((time_expire - start) // precision) + 1
     if pos < position then
       -- we cannot set it in the past
       pos = position
     end
-    local ring_idx = math_floor((pos - 1) / ringsize) + 1
+    local ring_idx = ((pos - 1) // ringsize) + 1
     local slot_idx = pos - (ring_idx - 1) * ringsize
 
     -- fetch actual ring table
     local ring = rings[ring_idx]
     if not ring then
-      ring = new_tab(ringsize, 0)
+      ring = {}
       rings[ring_idx] = ring
       if ring_idx > rings_n then
         rings_n = ring_idx
+
       end
     end
 
@@ -218,10 +169,10 @@ function _M.new(opts)
     return id
   end
 
-  --- Cancels a timer.
-  -- @param id the timer id to cancel
-  -- @return `true` if cancelled, `false` if not found
-  function wheel:cancel(id)
+  ---取消定时器
+  ---@param id number @the timer id to cancel
+  ---@return boolean @`true` if cancelled, `false` if not found
+  function wheel:Cancel(id)
     local slot = id_list[id]
     if slot then
       local idx = slot[id]
@@ -238,65 +189,6 @@ function _M.new(opts)
     end
     return false
   end
-
-  --- Looks up the next expiring timer.
-  -- Note: traverses the wheel, O(n) operation!
-  -- @param max_ahead (optional) maximum time (in seconds)
-  -- to look ahead
-  -- @return number of seconds until next timer expires (can be negative), or
-  -- 'nil' if there is no timer from now to `max_ahead`
-  -- @usage
-  -- local t = wheel:peek(10)
-  -- if t then
-  --   print("next timer expires in ", t," seconds")
-  -- else
-  --   print("no timer scheduled for the next 10 seconds")
-  -- end
-  function wheel:peek(max_ahead)
-    if count == 0 then
-      return nil
-    end
-    local time_now = now()
-
-    -- convert max_ahead from seconds to positions
-    if max_ahead then
-      max_ahead = math_floor((time_now + max_ahead - start) / precision)
-    else
-      max_ahead = math_huge
-    end
-
-    local position_idx = position
-    local ring_idx = 1
-    local ring = rings[ring_idx] or EMPTY -- TODO: if EMPTY then we can skip it?
-    local ahead_count = 0
-    while ahead_count < max_ahead do
-
-      local slot = ring[position_idx]
-      if slot then
-        if slot[1] then
-          -- we have a timer
-          return ((ring_idx - 1) * ringsize + position_idx) * precision +
-                 start - time_now
-        end
-      end
-
-      -- there is nothing in this position
-      position_idx = position_idx + 1
-      ahead_count = ahead_count + 1
-      if position_idx > ringsize then
-        position_idx = 1
-        ring_idx = ring_idx + 1
-        ring = rings[ring_idx] or EMPTY
-      end
-    end
-
-    -- we hit max_ahead, without finding a timer
-    return nil
-  end
-
---  if _G._TEST then   -- export test variables only when testing
---    wheel._rings = rings
---  end
 
   return wheel
 end
